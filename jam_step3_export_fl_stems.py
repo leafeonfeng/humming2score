@@ -1,0 +1,849 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+
+DEMUCS_STEMS = (
+    "vocals",
+    "drums",
+    "bass",
+    "guitar",
+    "piano",
+    "other",
+)
+
+FL_EXPORT_NAMES = {
+    "vocals": "01_Vocals.wav",
+    "drums": "02_Drums.wav",
+    "guitar": "03_Electric_Guitars_Combined.wav",
+    "piano": "04_Keyboard.wav",
+    "other": "05_Synth_And_Other.wav",
+    "bass": "06_Low_Frequency_Leakage_No_Bass_Player.wav",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Step 3: run the Demucs 6-source model and export aligned "
+            "24-bit WAV stems for FL Studio."
+        )
+    )
+
+    parser.add_argument(
+        "--jam-root",
+        type=Path,
+        default=Path("output_jam/by_source"),
+        help=(
+            "Directory containing one folder per Jam recording. "
+            "Default: output_jam/by_source"
+        ),
+    )
+
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=Path("output_jam/fl_studio"),
+        help=(
+            "FL Studio export directory. "
+            "Default: output_jam/fl_studio"
+        ),
+    )
+
+    parser.add_argument(
+        "--source-name",
+        type=str,
+        default=None,
+        help=(
+            "Only process one Jam folder, for example jam_001. "
+            "Default: process every folder."
+        ),
+    )
+
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="htdemucs_6s",
+        help="Demucs six-source model. Default: htdemucs_6s",
+    )
+
+    parser.add_argument(
+        "--device",
+        choices=["cuda", "cpu"],
+        default="cuda",
+        help="Demucs processing device. Default: cuda",
+    )
+
+    parser.add_argument(
+        "--overwrite-separation",
+        action="store_true",
+        help="Run Demucs again even if six-source results already exist.",
+    )
+
+    parser.add_argument(
+        "--overwrite-export",
+        action="store_true",
+        help="Overwrite existing FL Studio WAV exports.",
+    )
+
+    parser.add_argument(
+        "--exclude-leakage-track",
+        action="store_true",
+        help=(
+            "Do not export the bass-model output. Since the arrangement has "
+            "no bass player, this track normally contains low-frequency "
+            "leakage and separation errors."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    return args
+
+
+def format_command(command: list[str]) -> str:
+    return " ".join(
+        f'"{part}"' if " " in str(part) else str(part)
+        for part in command
+    )
+
+
+def format_seconds(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    remaining_seconds = total_seconds % 60
+
+    if hours:
+        return (
+            f"{hours:02d}:"
+            f"{minutes:02d}:"
+            f"{remaining_seconds:02d}"
+        )
+
+    return f"{minutes:02d}:{remaining_seconds:02d}"
+
+
+def check_requirements(device: str) -> None:
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "FFmpeg was not found in PATH."
+        )
+
+    if shutil.which("ffprobe") is None:
+        raise RuntimeError(
+            "FFprobe was not found in PATH."
+        )
+
+    demucs_check = subprocess.run(
+        [sys.executable, "-m", "demucs", "--help"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    if demucs_check.returncode != 0:
+        raise RuntimeError(
+            "Demucs is not available in this Python environment.\n"
+            "Install it with:\n"
+            "  python -m pip install demucs"
+        )
+
+    if device != "cuda":
+        return
+
+    try:
+        import torch
+
+    except ImportError as error:
+        raise RuntimeError(
+            "PyTorch is not installed."
+        ) from error
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "--device cuda was selected, but CUDA is unavailable.\n"
+            "Check with:\n"
+            "  python -c \"import torch; "
+            "print(torch.cuda.is_available())\""
+        )
+
+    print(
+        "[INFO] CUDA GPU: "
+        f"{torch.cuda.get_device_name(0)}",
+        flush=True,
+    )
+
+
+def collect_source_directories(
+    jam_root: Path,
+    source_name: str | None,
+) -> list[Path]:
+    if source_name is not None:
+        source_dir = jam_root / source_name
+
+        if not source_dir.is_dir():
+            raise FileNotFoundError(
+                "Jam source directory does not exist:\n"
+                f"{source_dir}"
+            )
+
+        return [source_dir]
+
+    return sorted(
+        path
+        for path in jam_root.iterdir()
+        if path.is_dir()
+    )
+
+
+def find_work_wav(
+    source_dir: Path,
+    source_name: str,
+    jam_root: Path,
+) -> Path:
+    """Find the converted source WAV generated by Step 1."""
+    output_jam_root = jam_root.parent
+
+    candidates = [
+        output_jam_root / "work_wav" / f"{source_name}.wav",
+        source_dir / f"{source_name}.wav",
+        source_dir / "source.wav",
+    ]
+
+    for candidate in candidates:
+        if candidate.is_file():
+            resolved_path = candidate.resolve()
+
+            print(
+                f"  [INFO] Step 1 source WAV: {resolved_path}",
+                flush=True,
+            )
+
+            return resolved_path
+
+    work_wav_dir = output_jam_root / "work_wav"
+
+    # Fallback for small filename differences, such as capitalization.
+    if work_wav_dir.is_dir():
+        wav_files = sorted(
+            path
+            for path in work_wav_dir.iterdir()
+            if path.is_file() and path.suffix.lower() == ".wav"
+        )
+
+        case_insensitive_matches = [
+            path
+            for path in wav_files
+            if path.stem.casefold() == source_name.casefold()
+        ]
+
+        if len(case_insensitive_matches) == 1:
+            resolved_path = case_insensitive_matches[0].resolve()
+
+            print(
+                f"  [INFO] Step 1 source WAV: {resolved_path}",
+                flush=True,
+            )
+
+            return resolved_path
+
+    raise FileNotFoundError(
+        "Could not find the Step 1 source WAV.\n"
+        f"Jam name: {source_name}\n"
+        f"Expected primary path:\n"
+        f"  {candidates[0].resolve()}\n"
+        "\n"
+        "Available WAV files in Step 1 work directory:\n"
+        + (
+            "\n".join(
+                f"  {path.resolve()}"
+                for path in wav_files
+            )
+            if work_wav_dir.is_dir() and wav_files
+            else f"  No WAV files found in {work_wav_dir.resolve()}"
+        )
+    )
+
+
+def get_audio_duration_seconds(audio_path: Path) -> float:
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(audio_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    try:
+        duration = float(result.stdout.strip())
+
+    except ValueError as error:
+        raise RuntimeError(
+            f"Could not read duration: {audio_path}"
+        ) from error
+
+    if duration <= 0:
+        raise RuntimeError(
+            f"Invalid audio duration: {audio_path}"
+        )
+
+    return duration
+
+
+def run_with_heartbeat(
+    command: list[str],
+    label: str,
+    interval_seconds: float = 10.0,
+) -> None:
+    print("  [CMD]", flush=True)
+    print(f"  {format_command(command)}", flush=True)
+
+    started_at = time.monotonic()
+    stop_event = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_event.wait(interval_seconds):
+            elapsed = time.monotonic() - started_at
+
+            print(
+                "\n"
+                f"  [RUNNING] {label} | "
+                f"elapsed {format_seconds(elapsed)}",
+                flush=True,
+            )
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        daemon=True,
+    )
+
+    heartbeat_thread.start()
+
+    try:
+        process = subprocess.Popen(command)
+        return_code = process.wait()
+
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=1.0)
+
+    elapsed = time.monotonic() - started_at
+
+    if return_code != 0:
+        raise subprocess.CalledProcessError(
+            returncode=return_code,
+            cmd=command,
+        )
+
+    print(
+        f"  [OK] Completed in {format_seconds(elapsed)}.",
+        flush=True,
+    )
+
+
+def run_six_source_separation(
+    source_wav: Path,
+    separation_root: Path,
+    model: str,
+    device: str,
+    overwrite: bool,
+) -> Path:
+    expected_output_dir = (
+        separation_root
+        / model
+        / source_wav.stem
+    )
+
+    expected_files = [
+        expected_output_dir / f"{stem_name}.wav"
+        for stem_name in DEMUCS_STEMS
+    ]
+
+    if (
+        not overwrite
+        and all(path.exists() for path in expected_files)
+    ):
+        print(
+            "  [SKIP] Existing six-source separation found.",
+            flush=True,
+        )
+
+        return expected_output_dir
+
+    print(
+        "  [STEP 1/3] Running Demucs six-source separation.",
+        flush=True,
+    )
+
+    print(
+        "  [INFO] guitar.wav may contain both electric guitars.",
+        flush=True,
+    )
+
+    print(
+        "  [INFO] piano.wav is used as the keyboard estimate.",
+        flush=True,
+    )
+
+    print(
+        "  [INFO] bass.wav is treated as low-frequency leakage.",
+        flush=True,
+    )
+
+    command = [
+        sys.executable,
+        "-u",
+        "-m",
+        "demucs",
+        "-v",
+        "-n",
+        model,
+        "-d",
+        device,
+        "--out",
+        str(separation_root),
+        str(source_wav),
+    ]
+
+    run_with_heartbeat(
+        command=command,
+        label=(
+            f"Demucs {model} separation "
+            f"for {source_wav.name}"
+        ),
+    )
+
+    missing_files = [
+        path
+        for path in expected_files
+        if not path.exists()
+    ]
+
+    if missing_files:
+        raise FileNotFoundError(
+            "Demucs completed, but expected stems are missing:\n"
+            + "\n".join(
+                f"  {path}"
+                for path in missing_files
+            )
+        )
+
+    return expected_output_dir
+
+
+def export_one_stem(
+    source_path: Path,
+    output_path: Path,
+    duration_seconds: float,
+    overwrite: bool,
+) -> None:
+    if output_path.exists() and not overwrite:
+        print(
+            f"    [SKIP] {output_path.name}",
+            flush=True,
+        )
+
+        return
+
+    command = [
+        "ffmpeg",
+        "-y" if overwrite else "-n",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source_path),
+        "-af",
+        (
+            "apad=whole_dur="
+            f"{duration_seconds:.6f},"
+            "atrim=start=0:"
+            f"end={duration_seconds:.6f}"
+        ),
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-c:a",
+        "pcm_s24le",
+        str(output_path),
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Could not export {output_path.name}:\n"
+            f"{result.stderr.strip()}"
+        )
+
+    print(
+        f"    [OK] {output_path.name}",
+        flush=True,
+    )
+
+
+def write_manifest(
+    output_dir: Path,
+    source_name: str,
+    source_wav: Path,
+    duration_seconds: float,
+    exported_stems: list[tuple[str, Path]],
+    model: str,
+) -> None:
+    manifest_path = output_dir / "FL_STUDIO_TRACKS.csv"
+
+    with manifest_path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",
+    ) as file:
+        writer = csv.writer(file)
+
+        writer.writerow(
+            [
+                "track_order",
+                "role",
+                "file_name",
+                "start_seconds",
+                "duration_seconds",
+                "notes",
+            ]
+        )
+
+        notes_by_stem = {
+            "vocals": "Separated lead/backing vocals",
+            "drums": "Combined drum-kit stem",
+            "guitar": (
+                "Both electric guitars may remain mixed together"
+            ),
+            "piano": (
+                "Keyboard estimate; may contain guitar or synth leakage"
+            ),
+            "other": (
+                "Synthesizer, keyboard residual and separation leakage"
+            ),
+            "bass": (
+                "No bass player: treat as low-frequency leakage"
+            ),
+        }
+
+        for track_order, (
+            stem_name,
+            output_path,
+        ) in enumerate(exported_stems, start=1):
+            writer.writerow(
+                [
+                    track_order,
+                    stem_name,
+                    output_path.name,
+                    "0.000000",
+                    f"{duration_seconds:.6f}",
+                    notes_by_stem[stem_name],
+                ]
+            )
+
+    readme_path = output_dir / "README_FL_STUDIO.txt"
+
+    exported_file_list = "\n".join(
+        f"- {path.name}"
+        for _, path in exported_stems
+    )
+
+    readme_path.write_text(
+        f"""FL Studio Stem Export
+=====================
+
+Source:
+{source_name}
+
+Source WAV:
+{source_wav}
+
+Separation model:
+{model}
+
+Duration:
+{duration_seconds:.6f} seconds
+
+Audio format:
+- WAV
+- 44.1 kHz
+- Stereo
+- 24-bit PCM
+- Every track starts at 0 seconds
+- Every track has the same duration
+- No per-stem normalization was applied
+
+Arrangement supplied by the musician:
+- Two electric guitars
+- One keyboard/synthesizer
+- One drum kit
+- Vocals
+- No bass player
+
+Important separation limitations:
+- The guitar stem can contain both electric guitars.
+- Standard Demucs does not identify Guitar 1 and Guitar 2 separately.
+- The piano stem is treated as the keyboard estimate.
+- Synth sounds may appear in piano.wav, other.wav, or both.
+- bass.wav does not represent a real bass player in this recording.
+  It is exported only as a low-frequency leakage/reference track.
+- Do not automatically mix bass leakage back into the project.
+- Separation artifacts and instrument bleed are expected.
+
+Exported files:
+{exported_file_list}
+
+FL Studio import:
+1. Create a new empty project.
+2. Set the project sample rate to 44100 Hz.
+3. Drag every WAV file into the Playlist.
+4. Place every clip at exactly 00:00.
+5. Keep time stretching disabled initially.
+6. Route each Audio Clip to its own Mixer Insert.
+7. Check phase and leakage before applying EQ or compression.
+
+Suggested FL routing:
+- Vocals -> Vocal Bus
+- Drums -> Drum Bus
+- Electric Guitars Combined -> Guitar Bus
+- Keyboard -> Keyboard Bus
+- Synth And Other -> Synth/Other Bus
+- Low Frequency Leakage -> Keep muted until reviewed
+
+Do not align these tracks manually by waveform:
+they already share the same zero point and duration.
+""",
+        encoding="utf-8",
+    )
+
+
+def export_for_fl_studio(
+    source_name: str,
+    source_wav: Path,
+    demucs_stem_dir: Path,
+    output_root: Path,
+    model: str,
+    exclude_leakage_track: bool,
+    overwrite: bool,
+) -> Path:
+    print(
+        "  [STEP 2/3] Exporting aligned FL Studio WAV files.",
+        flush=True,
+    )
+
+    duration_seconds = get_audio_duration_seconds(source_wav)
+
+    output_dir = output_root / source_name
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    export_order = [
+        "vocals",
+        "drums",
+        "guitar",
+        "piano",
+        "other",
+    ]
+
+    if not exclude_leakage_track:
+        export_order.append("bass")
+
+    exported_stems: list[tuple[str, Path]] = []
+
+    for stem_name in export_order:
+        source_stem_path = (
+            demucs_stem_dir
+            / f"{stem_name}.wav"
+        )
+
+        if not source_stem_path.exists():
+            raise FileNotFoundError(
+                f"Missing source stem: {source_stem_path}"
+            )
+
+        output_path = (
+            output_dir
+            / FL_EXPORT_NAMES[stem_name]
+        )
+
+        export_one_stem(
+            source_path=source_stem_path,
+            output_path=output_path,
+            duration_seconds=duration_seconds,
+            overwrite=overwrite,
+        )
+
+        exported_stems.append(
+            (stem_name, output_path)
+        )
+
+    print(
+        "  [STEP 3/3] Writing FL Studio manifest.",
+        flush=True,
+    )
+
+    write_manifest(
+        output_dir=output_dir,
+        source_name=source_name,
+        source_wav=source_wav,
+        duration_seconds=duration_seconds,
+        exported_stems=exported_stems,
+        model=model,
+    )
+
+    return output_dir
+
+
+def process_one_source(
+    source_dir: Path,
+    args: argparse.Namespace,
+) -> Path:
+    source_name = source_dir.name
+
+    source_wav = find_work_wav(
+        source_dir=source_dir,
+        source_name=source_name,
+        jam_root=args.jam_root,
+    )
+
+    separation_root = (
+        args.jam_root.parent
+        / "_demucs_6s_raw"
+    )
+
+    demucs_stem_dir = run_six_source_separation(
+        source_wav=source_wav,
+        separation_root=separation_root,
+        model=args.model,
+        device=args.device,
+        overwrite=args.overwrite_separation,
+    )
+
+    return export_for_fl_studio(
+        source_name=source_name,
+        source_wav=source_wav,
+        demucs_stem_dir=demucs_stem_dir,
+        output_root=args.output_root,
+        model=args.model,
+        exclude_leakage_track=args.exclude_leakage_track,
+        overwrite=args.overwrite_export,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+
+    if not args.jam_root.is_dir():
+        print(
+            "[ERROR] Jam root does not exist:\n"
+            f"  {args.jam_root.resolve()}",
+            flush=True,
+        )
+
+        sys.exit(1)
+
+    try:
+        check_requirements(args.device)
+
+        source_directories = collect_source_directories(
+            jam_root=args.jam_root,
+            source_name=args.source_name,
+        )
+
+    except Exception as error:
+        print(f"[ERROR]\n{error}", flush=True)
+        sys.exit(1)
+
+    if not source_directories:
+        print(
+            "[WARN] No Jam source directories found.",
+            flush=True,
+        )
+
+        return
+
+    print("=" * 76)
+    print("[INFO] Step 3: Six-Source Separation -> FL Studio WAV Export")
+    print(f"[INFO] Model : {args.model}")
+    print(f"[INFO] Device: {args.device}")
+    print("[INFO] Arrangement: two guitars, keys/synth, drums, vocals")
+    print("[INFO] No bass player")
+    print("[INFO] All exports: 44.1 kHz, stereo, 24-bit, aligned at 0")
+    print("=" * 76)
+
+    success_count = 0
+
+    for index, source_dir in enumerate(
+        source_directories,
+        start=1,
+    ):
+        print()
+        print(
+            f"[{index}/{len(source_directories)}] "
+            f"Processing: {source_dir.name}",
+            flush=True,
+        )
+
+        try:
+            output_dir = process_one_source(
+                source_dir=source_dir,
+                args=args,
+            )
+
+            print(
+                f"  [OK] FL Studio export: {output_dir}",
+                flush=True,
+            )
+
+            success_count += 1
+
+        except Exception as error:
+            print(
+                f"  [FAIL] {error}",
+                flush=True,
+            )
+
+    print()
+    print("=" * 76)
+    print(
+        "[DONE] Successfully exported: "
+        f"{success_count}/{len(source_directories)}",
+        flush=True,
+    )
+    print(
+        f"[OUTPUT] {args.output_root.resolve()}",
+        flush=True,
+    )
+    print("=" * 76)
+
+
+if __name__ == "__main__":
+    main()
